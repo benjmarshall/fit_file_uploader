@@ -4,7 +4,7 @@ certifi==2024.2.2
 charset-normalizer==3.3.2
 et-xmlfile==1.1.0
 fit-tool==0.9.13
-garth==0.4.47
+garth==0.5.2
 idna==3.7
 jdcal==1.4.1
 markdown-it-py==3.0.0
@@ -23,3 +23,4 @@ urllib3==2.2.1
 watchdog==6.0.0
 pyyaml==6.0.2
 pick==2.4.0
+intervalsicu @ git+https://github.com/benjmarshall/py-intervalsicu

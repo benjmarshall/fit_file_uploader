@@ -6,6 +6,7 @@ Simulates an Edge 830 device
 """
 import argparse
 from datetime import datetime
+from datetime import timezone
 import os
 import json
 import logging
@@ -23,6 +24,22 @@ from dotenv import load_dotenv
 from rich.console import Console
 from rich.logging import RichHandler
 from pick import pick
+from intervalsicu import Intervals
+
+from fit_tool.fit_file import FitFile
+from fit_tool.profile.messages.device_info_message import DeviceInfoMessage
+from fit_tool.profile.messages.file_id_message import FileIdMessage
+from fit_tool.profile.messages.workout_message import WorkoutMessage
+from fit_tool.profile.profile_type import Manufacturer, GarminProduct
+from fit_tool.profile.profile_type import Sport
+from fit_tool.fit_file_builder import FitFileBuilder
+
+from garminconnect import (
+    Garmin,
+    GarminConnectAuthenticationError,
+    GarminConnectConnectionError,
+    GarminConnectTooManyRequestsError,
+)
 
 _logger = logging.getLogger('garmin')
 
@@ -35,13 +52,6 @@ _logger.setLevel(logging.INFO)
 logging.getLogger('urllib3.connectionpool').setLevel(logging.WARNING)
 logging.getLogger('oauth1_auth').setLevel(logging.WARNING)
 
-from fit_tool.fit_file import FitFile
-from fit_tool.profile.messages.device_info_message import DeviceInfoMessage
-from fit_tool.profile.messages.file_id_message import FileIdMessage
-from fit_tool.profile.profile_type import Manufacturer, GarminProduct
-from fit_tool.fit_file_builder import FitFileBuilder
-
-
 load_dotenv()
 c = Console()
 
@@ -49,6 +59,7 @@ EDGE830 = GarminProduct.EDGE_830
 GARMIN = Manufacturer.GARMIN
 FILES_UPLOADED_NAME = Path('.uploaded_files.json')
 CONFIG_FILE = Path('.config')
+tokenstore = os.getenv("GARMINTOKENS") or ".garth"
 
 class FitFileLogFilter(logging.Filter):
     """Filter to remove specific warning from the fit_tool module"""
@@ -131,11 +142,58 @@ def get_date_from_fit(fit_path: Path) -> Optional[datetime]:
         message = record.message
         if message.global_id == FileIdMessage.ID:
             if isinstance(message, FileIdMessage):
-                res = datetime.fromtimestamp(message.time_created/1000.0) # type: ignore
+                res = datetime.fromtimestamp(message.time_created/1000.0,timezone.utc) # type: ignore
                 break
     return res
 
-def edit_fit(fit_path: Path, output: Optional[Path] = None, dryrun: bool = False) -> Path:
+def get_name_from_intervals(dt: datetime) -> str:
+    intervals_athleteid = os.environ.get('INTERVALS_ATHLETEID', None)
+    intervals_apikey = os.environ.get('INTERVALS_APIKEY', None)
+    if intervals_athleteid==None or intervals_apikey==None:
+        return ""
+    else:
+        _logger.debug('Searching for workout name on Intervals.icu')
+        _logger.debug("Authenticating to Intervals.icu")
+        svc = Intervals(intervals_athleteid, intervals_apikey, strict=False)
+        today = dt.strftime("%Y-%m-%d")
+        activities = svc.activities_list(today,today)
+        for activity in activities:
+            if activity['oauth_client_name'] == 'Training Peaks Virtual':
+                dt_intervals = datetime.fromisoformat(activity['start_date'])
+                delta = dt_intervals-dt
+                if abs(delta.total_seconds())<=15:
+                    _logger.debug(f"Found matching activity: \"{activity['name']}\"")
+                    return activity['name']
+        
+    return ""
+
+def find_and_set_garmin_activity_name(dt: datetime, name: str):
+    garmin = Garmin()
+    garmin.login(tokenstore)
+    today = dt
+    activities = garmin.get_activities_by_date(
+    today.isoformat(), today.isoformat(), 'cycling' 
+    )
+
+    # Download activities
+    for activity in activities:
+        dt_garmin = datetime.strptime(
+            activity["startTimeLocal"], "%Y-%m-%d %H:%M:%S"
+        )
+        dt_garmin = dt_garmin.astimezone(timezone.utc)
+        activity_id = activity["activityId"]
+        delta = dt_garmin-dt
+        if abs(delta.total_seconds())<10:
+            _logger.debug(f"Found matching garmin activity: {activity_id}")
+            modify_name(activity_id,name)
+
+def modify_name(activity_id, name: str):
+    garmin = Garmin()
+    garmin.login(tokenstore)
+    garmin.set_activity_name(activity_id, name)
+    _logger.debug(f"Activity name set to \"{name}\"")
+
+def edit_fit(fit_path: Path, output: Optional[Path] = None, dryrun: bool = False, name: str = "") -> Path:
     fit_file = FitFile.from_file(str(fit_path))
     if not output:
         output = fit_path.parent / f"{fit_path.stem}_modified.fit"
@@ -149,7 +207,7 @@ def edit_fit(fit_path: Path, output: Optional[Path] = None, dryrun: bool = False
         # change file id to indicate file was saved by Edge 830
         if message.global_id == FileIdMessage.ID:
             if isinstance(message, FileIdMessage):
-                dt = datetime.fromtimestamp(message.time_created/1000.0)   # type: ignore
+                dt = datetime.fromtimestamp(message.time_created/1000.0,timezone.utc)   # type: ignore
                 _logger.info(f"Activity timestamp is \"{dt.isoformat()}\"")
                 print_message(f"Record: {i}", message)
                 if message.manufacturer == Manufacturer.DEVELOPMENT.value:
@@ -157,7 +215,7 @@ def edit_fit(fit_path: Path, output: Optional[Path] = None, dryrun: bool = False
                     message.product = GarminProduct.EDGE_830.value
                     message.manufacturer = Manufacturer.GARMIN.value
                     print_message(f"    New Record: {i}", message)
-        
+
         # change device info messages
         if message.global_id == DeviceInfoMessage.ID:
             if isinstance(message, DeviceInfoMessage):
@@ -170,6 +228,12 @@ def edit_fit(fit_path: Path, output: Optional[Path] = None, dryrun: bool = False
                     print_message(f"    New Record: {i}", message)
 
         builder.add(message)
+    
+    if name:
+        message = WorkoutMessage()
+        message.workout_name = name
+        message.sport = Sport.CYCLING
+        builder.add(message)
 
     modified_file = builder.build()
     _logger.info(f"Saving modified data to \"{output}\"")
@@ -177,7 +241,7 @@ def edit_fit(fit_path: Path, output: Optional[Path] = None, dryrun: bool = False
         modified_file.to_file(str(output))
     return output
     
-def upload(fn: Path, original_path: Optional[Path] = None, dryrun: bool = False):
+def upload(fn: Path, original_path: Optional[Path] = None, dryrun: bool = False, dt: datetime = None, name: str = ""):
     # get credentials and login if needed
     import garth
     from garth.exc import GarthException, GarthHTTPError
@@ -206,8 +270,12 @@ def upload(fn: Path, original_path: Optional[Path] = None, dryrun: bool = False)
         try:
             if not dryrun:
                 upload_result = garth.client.upload(f)
-            _logger.info(f':white_check_mark: Successfully uploaded "{str(original_path)}"')
-            return upload_result
+                _logger.info(f':white_check_mark: Successfully uploaded "{str(original_path)}"')
+                if not(dt==None) and name:
+                    _logger.debug("Attempting to change activity name...")
+                    time.sleep(5) # Delay to allowed Garmin to process the upload
+                    find_and_set_garmin_activity_name(dt,name)
+                return upload_result
         except GarthHTTPError as e:
             if e.error.response.status_code == 409:
                 _logger.warning(f":x: Received HTTP conflict (activity already exists) for \"{str(original_path)}\"")
@@ -249,9 +317,12 @@ def upload_all(dir: Path, preinitialise: bool = False, dryrun: bool = False):
         if not preinitialise:
             with NamedTemporaryFile(delete=True, delete_on_close=False) as fp:
                 #try:
-                    output = edit_fit(dir.joinpath(f), output=Path(fp.name))
+                    p = dir.joinpath(f)
+                    dt = get_date_from_fit(p)
+                    name = get_name_from_intervals(dt)
+                    output = edit_fit(p, output=Path(fp.name), dryrun=dryrun, name=name)
                     _logger.info(f"Uploading modified file to Garmin Connect")
-                    res = upload(output, original_path=Path(f), dryrun=dryrun)
+                    res = upload(output, original_path=Path(f), dryrun=dryrun, dt=dt, name=name)
                     _logger.debug(f"Adding \"{f}\" to \"uploaded_files\"")
                 #except:
                 #    _logger.warning(f"Failed  to modify file \"{f}\", possibly malformed FIT file.")
@@ -325,13 +396,15 @@ if __name__ == '__main__':
         upload_all(Path(watch_dir), args.preinitialise, args.dryrun)
     elif args.daemonise:
         if not args.input_file:
-            print(config['TPV_ID'])
             watch_dir = TPVFolder.joinpath(config['TPV_ID']).joinpath('FITFiles')
         else:
             watch_dir = args.input_file
         daemonise(Path(watch_dir))
     else:
         p = Path(args.input_file)
-        output_path = edit_fit(p, dryrun=args.dryrun)
+        dt = get_date_from_fit(p)
+        name = get_name_from_intervals(dt)
+        output_path = edit_fit(p, dryrun=args.dryrun, name=name)
         if args.upload:
-            upload(output_path, original_path=p, dryrun=args.dryrun)
+            upload(output_path, original_path=p, dryrun=args.dryrun, dt=dt, name=name)
+            
