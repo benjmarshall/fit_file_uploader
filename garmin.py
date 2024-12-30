@@ -73,9 +73,14 @@ class NewFileEventHandler(PatternMatchingEventHandler):
         PatternMatchingEventHandler.__init__(self, patterns=['*.fit'],
                                                              ignore_directories=True, case_sensitive=False)
     def on_created(self, event) -> None:
-        _logger.debug("New file created - % s." % event.src_path)
-        # Wait for a short time to make sure TPV has finished writing to the file
-        time.sleep(5)
+        _logger.info("New file created - % s." % event.src_path)
+        _logger.info("Pausing to allow file creation to complete")
+        # Wait for a short time to make sure TPV has finished writing to the file and that the upload to intervals.icu has completed.
+        intervals_athleteid = os.environ.get('INTERVALS_ATHLETEID', None)
+        if intervals_athleteid==None:
+            time.sleep(5)
+        else:
+            time.sleep(30)
         # Run the upload all function
         upload_all(Path(event.src_path).parent.absolute())
 
@@ -150,6 +155,7 @@ def get_name_from_intervals(dt: datetime) -> str:
     intervals_athleteid = os.environ.get('INTERVALS_ATHLETEID', None)
     intervals_apikey = os.environ.get('INTERVALS_APIKEY', None)
     if intervals_athleteid==None or intervals_apikey==None:
+        _logger.debug('No Intervals.icu credentials configured, skipping activity name check')
         return ""
     else:
         _logger.debug('Searching for workout name on Intervals.icu')
@@ -164,7 +170,7 @@ def get_name_from_intervals(dt: datetime) -> str:
                 if abs(delta.total_seconds())<=15:
                     _logger.debug(f"Found matching activity: \"{activity['name']}\"")
                     return activity['name']
-        
+    _logger.debug('No matching activity found on Intervals.icu, cannot set name')    
     return ""
 
 def find_and_set_garmin_activity_name(dt: datetime, name: str):
@@ -275,6 +281,8 @@ def upload(fn: Path, original_path: Optional[Path] = None, dryrun: bool = False,
                     _logger.debug("Attempting to change activity name...")
                     time.sleep(5) # Delay to allowed Garmin to process the upload
                     find_and_set_garmin_activity_name(dt,name)
+                else:
+                    _logger.debug("Skipping activity renaming")
                 return upload_result
         except GarthHTTPError as e:
             if e.error.response.status_code == 409:
